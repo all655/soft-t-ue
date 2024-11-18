@@ -1,8 +1,5 @@
 #!/bin/bash
 
-PS4='[TEST: headless] '
-set -x
-
 # Check if the script is run as root
 if [ "$EUID" -ne 0 ]; then
 	echo "This script must be run as root."
@@ -26,6 +23,8 @@ UE_SESSION_NAME="ue"
 UE_SESSION_COMMAND="srsue $SCRIPT_DIR/../configs/zmq/ue_zmq.conf $@"
 UE_SESSION_LOG="/tmp/headless_ue.log"
 
+rm -rf $UE_SESSION_LOG $CORE_SESSION_LOG $GNB_SESSION_LOG
+
 kill_existing_screen() {
 	local session_name=$1
 	if screen -list | grep -q "$session_name"; then
@@ -36,6 +35,16 @@ kill_existing_screen() {
 		fi
 	fi
 	return 0
+}
+
+stop_script() {
+	kill_existing_screen "$UE_SESSION_NAME"
+	kill_existing_screen "$GNB_SESSION_NAME"
+	kill_existing_screen "$CORE_SESSION_NAME"
+	screen -wipe
+	ps aux | awk '/open/{print $2}' | while read -r pid; do kill -9 $pid; done
+	ps aux | awk '/srsue/{print $2}' | while read -r pid; do kill -9 $pid; done
+	ps aux | awk '/gnb/{print $2}' | while read -r pid; do kill -9 $pid; done
 }
 
 start_screen_session() {
@@ -50,12 +59,30 @@ start_screen_session() {
 	return 0
 }
 
+await_log() {
+	MAX_RETRIES=$3
+	while ((1)); do
+		if grep -q "$2" "$1"; then
+			break
+		fi
+
+		if ((retries > MAX_RETRIES)); then
+			echo "log $2 not found in $1"
+			stop_script
+			exit 1
+		fi
+
+		sleep 2
+		((retries++))
+	done
+}
+
 ip netns add ue1 >/dev/null 2>&1
 
 start_screen_session "$CORE_SESSION_NAME" "$CORE_SESSION_COMMAND" "$CORE_SESSION_LOG"
 CORE_STATUS=$?
 
-sleep 30
+await_log $CORE_SESSION_LOG "NF registered" 30
 
 start_screen_session "$GNB_SESSION_NAME" "$GNB_SESSION_COMMAND" "$GNB_SESSION_LOG"
 GNB_STATUS=$?
@@ -68,24 +95,13 @@ UE_STATUS=$?
 # Check if both sessions were started successfully
 if [ $CORE_STATUS -ne 0 ] || [ $GNB_STATUS -ne 0 ] || [ $UE_STATUS -ne 0 ]; then
 	echo "Failed to start screens"
+	stop_script
 	exit 1
 fi
 
 screen -ls
-screen -S "ue" -X attach
 
-kill_existing_screen "$UE_SESSION_NAME"
-kill_existing_screen "$GNB_SESSION_NAME"
-kill_existing_screen "$CORE_SESSION_NAME"
+await_log "$UE_SESSION_LOG" "PDU Session Establishment successful" 20
 
-cat $UE_SESSION_LOG
-
-if cat $SESSION_2_LOG | grep 'PDU Session'; then
-	echo "T UE Connected successfully"
-	exit 0
-else
-	echo "Connection Failed"
-	exit 1
-fi
-
-set -x
+stop_script
+exit 0
